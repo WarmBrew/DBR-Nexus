@@ -1,0 +1,105 @@
+# ============================================================
+# Qoder Device Management Server Configuration
+# ============================================================
+# This is the main configuration file for the server.
+# Copy this file to configs/server.yaml and modify as needed.
+# ============================================================
+
+# --- Server ---
+server:
+  # Listening address. Use ":8443" to listen on all interfaces,
+  # or "127.0.0.1:8443" to restrict to localhost only.
+  addr: ":8443"
+
+  # TLS configuration. Leave both empty to use plain HTTP.
+  # For production, it is strongly recommended to enable TLS.
+  tls:
+    cert: "certs/server.crt"
+    key: "certs/server.key"
+
+# --- Database ---
+database:
+  # SQLite database file path. Directory will be created automatically.
+  path: "./data/qoder.db"
+
+# --- Authentication ---
+auth:
+  # JWT signing secret. MUST be changed for production.
+  # Use a long random string (e.g., openssl rand -hex 32).
+  jwt_secret: "change-me-in-production"
+
+  # JWT token expiry duration.
+  jwt_expiry: 24h
+
+  # Pre-Shared Key for agent authentication.
+  # Must match the PSK configured in the agent's config file.
+  psk: "default-psk"
+
+# --- Logging ---
+logging:
+  # Log level: debug, info, warn, error
+  level: info
+
+  # Log file path. Set to "" to disable file logging (stdout only).
+  file: "./logs/server.log"
+
+  # Maximum size of a single log file in MB before rotation.
+  max_size: 100
+
+  # Maximum number of old log files to retain.
+  max_backups: 30
+
+  # Maximum number of days to retain old log files.
+  max_age: 30
+
+# --- Tunnel ---
+tunnel:
+  # Port range for tunnel port forwarding binding.
+  # Format: "interface:startPort-endPort"
+  # Use "0.0.0.0:10000-20000" to allow external access,
+  # or "127.0.0.1:10000-20000" to restrict to localhost.
+  bind_range: "127.0.0.1:10000-20000"
+
+  # Maximum idle duration for TCP port forwarding tunnels.
+  # Tunnels with no activity for this duration will be automatically closed.
+  port_forward_timeout: 30m
+
+  # Maximum idle duration for SOCKS5 proxy connections.
+  # SOCKS5 sessions idle for longer than this will be automatically closed.
+  socks5_timeout: 1h
+
+# --- Agent ---
+agent:
+  # Time without heartbeat before a device is marked offline.
+  heartbeat_timeout: 90s
+
+# --- Web Access Control ---
+web_access_control:
+  # Enable IP whitelist for web management interface (API + frontend).
+  # Does NOT affect agent/device connections.
+  enabled: false
+
+  # Comma-separated list of allowed IPs and CIDR ranges.
+  # Loopback addresses (127.0.0.1, ::1) are always allowed.
+  # Example: "192.168.1.0/24,10.0.0.1"
+  allowed_ips: ""
+
+# --- Encryption ---
+encryption:
+  # Enable application-layer traffic encryption for all WebSocket connections.
+  # When enabled, all Agent and Browser traffic is encrypted with AES-256-GCM.
+  # Falls back to cleartext for clients that don't support encryption.
+  enabled: true
+
+  # Minimum interval between dummy traffic messages (milliseconds).
+  min_dummy_interval_ms: 5000
+
+  # Maximum interval between dummy traffic messages (milliseconds).
+  max_dummy_interval_ms: 15000
+
+  # Timing jitter percentage for heartbeat/ping intervals.
+  # Applied as ±N% random variation to prevent fixed-interval fingerprinting.
+  timing_jitter_percent: 15
+
+  # Minimum encrypted frame size in bytes. Smaller messages are padded.
+  min_frame_size: 128

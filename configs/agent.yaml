@@ -1,0 +1,93 @@
+# ============================================================
+# Qoder Device Management Agent Configuration
+# ============================================================
+# This is the configuration file for the device agent.
+# Copy this file to configs/agent.yaml and modify as needed.
+#
+# Agent binary can also accept the config path as the first
+# argument: ./agent /path/to/agent.yaml
+#
+# You can embed server URL and PSK at build time via -ldflags:
+#   go build -ldflags "-X main.defaultServerURL=ws://1.2.3.4:8443/ws/agent -X main.defaultPSK=mypsk" ./cmd/agent/
+# ============================================================
+
+# --- Server Connection ---
+server:
+  # WebSocket URL of the management server.
+  # Use "wss://" if the server has TLS enabled.
+  url: "ws://localhost:8443/ws/agent"
+
+  # Pre-Shared Key for agent authentication.
+  # Must match the PSK configured in the server's config file.
+  psk: "default-psk"
+
+  # Reconnection settings when the connection to the server is lost.
+  reconnect:
+    # Initial delay before the first reconnection attempt.
+    initial_delay: 1s
+
+    # Maximum delay between reconnection attempts (exponential backoff cap).
+    max_delay: 60s
+
+    # Backoff multiplier. Each failed attempt multiplies the delay by this factor.
+    # For example: 1s -> 2s -> 4s -> 8s -> ... -> 60s (capped)
+    multiplier: 2
+
+# --- Heartbeat ---
+heartbeat:
+  # Interval between heartbeat messages sent to the server.
+  # If the server does not receive a heartbeat within 3x this interval
+  # (or the server's agent.heartbeat_timeout), the device is marked offline.
+  interval: 30s
+
+# --- Device Identity ---
+device:
+  # Unique device identifier. Leave empty to auto-generate based on
+  # system information (hostname + MAC address hash).
+  # If specified, it must be unique across all agents.
+  id: ""
+
+  # Labels for categorizing this device (e.g., environment, region).
+  # Example: ["production", "us-east"]
+  labels: []
+
+  # Tags for additional metadata.
+  # Example: ["web-server", "high-memory"]
+  tags: []
+
+# --- Logging ---
+logging:
+  # Log level: debug, info, warn, error
+  # Use "debug" for troubleshooting, "info" for normal operation.
+  level: info
+
+  # Log file path. Set to "" to disable file logging (stdout only).
+  # The directory will be created automatically.
+  file: "./logs/agent.log"
+
+  # Maximum size of a single log file in MB before rotation.
+  # When a log file reaches this size, it is rotated.
+  max_size: 50
+
+  # Maximum number of old log files to retain.
+  # Older files are deleted when this limit is exceeded.
+  max_backups: 10
+
+  # Maximum number of days to retain old log files.
+  # Files older than this are deleted regardless of max_backups.
+  max_age: 7
+
+# --- Tunnel ---
+tunnel:
+  # Maximum number of concurrent tunnel connections (port forwarding + SOCKS5).
+  # Each active tunnel session counts as one connection.
+  max_connections: 100
+
+# --- Encryption ---
+encryption:
+  # Enable application-layer traffic encryption.
+  # Must match the server's encryption setting.
+  enabled: true
+
+  # Timing jitter percentage for heartbeat intervals.
+  timing_jitter_percent: 15

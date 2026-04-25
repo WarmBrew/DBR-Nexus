@@ -1,0 +1,73 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+dbr-server
+dbr-agent
+server
+server_linux_amd64
+
+# Build directories
+bin/
+release/
+
+# Test binaries
+*.test
+
+# Output of go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+
+# Configs (keep templates but ignore actual configs)
+configs/local/
+
+# Certificates
+certs/*.key
+certs/*.crt
+certs/*.pem
+
+# Node modules
+web/node_modules/
+
+# Build output
+web/dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp

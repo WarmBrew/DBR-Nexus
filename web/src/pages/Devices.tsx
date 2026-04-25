@@ -40,22 +40,26 @@ export default function Devices() {
     const downloadUrl = `${baseUrl}/api/v1/agent/download?platform=${platform}&arch=${arch}&server_url=${encodeURIComponent(serverUrl || window.location.host)}${psk ? '&psk=' + encodeURIComponent(psk) : ''}`;
     const authHeader = authToken ? `-H "Authorization: Bearer ${authToken}"` : '';
 
+    // Detect if using HTTPS with self-signed cert (need -k for curl)
+    const isHttps = baseUrl.startsWith('https:');
+    const curlInsecure = isHttps ? ' -k' : '';
+
     if (platform === 'linux' || platform === 'darwin') {
       const binName = 'qoder-agent';
       return {
-        curl: `curl -sL ${authHeader} "${downloadUrl}" -o /tmp/${binName} && chmod +x /tmp/${binName} && /tmp/${binName}`,
-        wget: `wget -q ${authHeader ? '--header="Authorization: Bearer ' + authToken + '" ' : ''}"${downloadUrl}" -O /tmp/${binName} && chmod +x /tmp/${binName} && /tmp/${binName}`,
+        curl: `curl -sL${curlInsecure} ${authHeader} "${downloadUrl}" -o /tmp/${binName} && chmod +x /tmp/${binName} && /tmp/${binName}`,
+        wget: `wget -q ${authHeader ? '--header="Authorization: Bearer ' + authToken + '" ' : ''}--no-check-certificate "${downloadUrl}" -O /tmp/${binName} && chmod +x /tmp/${binName} && /tmp/${binName}`,
       };
     }
     // Windows
     const binName = 'qoder-agent.exe';
     const tmpDir = '$env:TEMP';
     const psCmd = authToken
-      ? `powershell -Command "$h=@{Authorization='Bearer ${authToken}'}; Invoke-WebRequest -Uri '${downloadUrl}' -Headers $h -OutFile ${tmpDir}\\${binName}; & '${tmpDir}\\${binName}'"`
-      : `powershell -Command "Invoke-WebRequest -Uri '${downloadUrl}' -OutFile ${tmpDir}\\${binName}; & '${tmpDir}\\${binName}'"`;
+      ? `powershell -Command "$h=@{Authorization='Bearer ${authToken}'}; [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; Invoke-WebRequest -Uri '${downloadUrl}' -Headers $h -OutFile ${tmpDir}\\${binName}; & '${tmpDir}\\${binName}'"`
+      : `powershell -Command "[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; Invoke-WebRequest -Uri '${downloadUrl}' -OutFile ${tmpDir}\\${binName}; & '${tmpDir}\\${binName}'"`;
     const cmdCmd = authToken
-      ? `curl -sL ${authHeader} "${downloadUrl}" -o "%TEMP%\\${binName}" && "%TEMP%\\${binName}"`
-      : `curl -sL "${downloadUrl}" -o "%TEMP%\\${binName}" && "%TEMP%\\${binName}"`;
+      ? `curl -sL${curlInsecure} ${authHeader} "${downloadUrl}" -o "%TEMP%\\${binName}" && "%TEMP%\\${binName}"`
+      : `curl -sL${curlInsecure} "${downloadUrl}" -o "%TEMP%\\${binName}" && "%TEMP%\\${binName}"`;
     return { powershell: psCmd, cmd: cmdCmd };
   }, [platform, arch, serverUrl, psk, authToken]);
 

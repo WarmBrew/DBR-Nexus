@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
-import { Table, Breadcrumb, Button, Space, Upload, Modal, message, Typography, Input, Popconfirm, Progress, Dropdown } from 'antd';
+import { Table, Breadcrumb, Button, Space, Upload, Modal, message, Typography, Input, Popconfirm, Dropdown } from 'antd';
 import { FolderOutlined, FileOutlined, UploadOutlined, DeleteOutlined, EditOutlined, ReloadOutlined, HomeOutlined, SearchOutlined, LockOutlined, FolderAddOutlined, DownloadOutlined, FileAddOutlined } from '@ant-design/icons';
 import apiClient from '../../api/client';
 import type { FileEntry, FileBrowseResult } from '../../api/types';
 import CodeEditor from './CodeEditor';
 import { formatBytes, GenerateID } from '../../api/helpers';
+import useUploadStore from '../../store/uploadSlice';
 
 const { Text } = Typography;
 
@@ -25,9 +26,9 @@ export default function FileBrowser({ deviceId }: Props) {
   const [chmodMode, setChmodMode] = useState('');
   const [mkdirVisible, setMkdirVisible] = useState(false);
   const [createFileVisible, setCreateFileVisible] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState<{ name: string; percent: number } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const { addTask, updateTask, removeTask } = useUploadStore();
 
   const fetchFiles = async (path: string) => {
     setLoading(true);
@@ -134,8 +135,17 @@ export default function FileBrowser({ deviceId }: Props) {
     const transferId = GenerateID();
     const targetPath = buildPath(currentPath, file.name);
 
+    // Add task to global upload store
+    addTask({
+      id: transferId,
+      name: file.name,
+      deviceId: deviceId,
+      percent: 0,
+      status: 'uploading',
+      startTime: Date.now(),
+    });
+
     try {
-      setUploadProgress({ name: file.name, percent: 0 });
       const chunkSize = 256 * 1024;
       const totalChunks = Math.ceil(file.size / chunkSize);
 
@@ -151,7 +161,6 @@ export default function FileBrowser({ deviceId }: Props) {
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, file.size);
         const chunk = file.slice(start, end);
-        const buffer = await chunk.arrayBuffer();
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve((reader.result as string).split(',')[1]);
@@ -165,7 +174,7 @@ export default function FileBrowser({ deviceId }: Props) {
           data: base64,
         });
 
-        setUploadProgress({ name: file.name, percent: Math.round(((i + 1) / totalChunks) * 100) });
+        updateTask(transferId, { percent: Math.round(((i + 1) / totalChunks) * 100) });
       }
 
       // Complete upload
@@ -173,12 +182,12 @@ export default function FileBrowser({ deviceId }: Props) {
         transfer_id: transferId,
       });
 
+      updateTask(transferId, { status: 'completed', percent: 100 });
       message.success(`${file.name} 上传成功`);
       fetchFiles(currentPath);
     } catch (e: any) {
+      updateTask(transferId, { status: 'error', error: e.response?.data?.error || '上传失败' });
       message.error(e.response?.data?.error || '上传失败');
-    } finally {
-      setUploadProgress(null);
     }
     return false;
   };
@@ -219,8 +228,17 @@ export default function FileBrowser({ deviceId }: Props) {
       const targetPath = buildPath(currentPath, relativePath);
       const transferId = GenerateID();
 
+      // Add task to global upload store
+      addTask({
+        id: transferId,
+        name: relativePath,
+        deviceId: deviceId,
+        percent: 0,
+        status: 'uploading',
+        startTime: Date.now(),
+      });
+
       try {
-        setUploadProgress({ name: relativePath, percent: 0 });
         const chunkSize = 256 * 1024;
         const totalChunks = Math.ceil(file.size / chunkSize);
 
@@ -257,19 +275,21 @@ export default function FileBrowser({ deviceId }: Props) {
             data: base64,
           });
 
-          setUploadProgress({ name: relativePath, percent: Math.round(((j + 1) / totalChunks) * 100) });
+          updateTask(transferId, { percent: Math.round(((j + 1) / totalChunks) * 100) });
         }
 
         // Complete upload
         await apiClient.post(`/devices/${deviceId}/files/upload/done`, {
           transfer_id: transferId,
         });
+
+        updateTask(transferId, { status: 'completed', percent: 100 });
       } catch (e: any) {
+        updateTask(transferId, { status: 'error', error: `上传失败: ${relativePath}` });
         message.error(`上传失败: ${relativePath}`);
       }
     }
 
-    setUploadProgress(null);
     message.success('文件夹上传完成');
     fetchFiles(currentPath);
     e.target.value = '';
@@ -370,17 +390,6 @@ export default function FileBrowser({ deviceId }: Props) {
           borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center',
         }}>
           <Text style={{ fontSize: 18, color: '#52c41a' }}>释放文件以上传到当前目录</Text>
-        </div>
-      )}
-
-      {/* Upload progress */}
-      {uploadProgress && (
-        <div style={{ marginBottom: 12, padding: '8px 12px', background: '#1e1e1e', borderRadius: 6, border: '1px solid #3c3c3c' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-            <Text style={{ fontSize: 12 }}>{uploadProgress.name}</Text>
-            <Text style={{ fontSize: 12 }}>{uploadProgress.percent}%</Text>
-          </div>
-          <Progress percent={uploadProgress.percent} size="small" strokeColor="#52c41a" />
         </div>
       )}
 

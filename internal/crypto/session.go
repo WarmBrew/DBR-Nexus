@@ -23,7 +23,7 @@ var PaddingBuckets = []int{128, 256, 512, 1024, 2048, 4096, 8192, 16384}
 const MinFrameSize = 128
 
 // MaxTimestampSkew is the maximum acceptable time difference in seconds
-const MaxTimestampSkew = 300
+const MaxTimestampSkew = 900
 
 // Session manages the encryption state for a single WebSocket connection
 type Session struct {

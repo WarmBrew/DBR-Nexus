@@ -166,7 +166,9 @@ export class CryptoSession {
     // Extract keys
     const encryptKeyBytes = derived.slice(0, 32);
     const macKeyBytes = derived.slice(32, 64);
-    session.nonceBase = derived.slice(64, 76).buffer;
+    // Use ArrayBuffer.slice() to create an independent copy of nonceBase
+    // (not a view) — this avoids issues with detached buffers after crypto operations
+    session.nonceBase = derived.buffer.slice(64, 76);
 
     // Import AES-GCM key
     session.encryptKey = await crypto.subtle.importKey(
@@ -236,17 +238,23 @@ export class CryptoSession {
     const flags = padding.length > 0 ? FLAG_HAS_PADDING : 0;
 
     // Build AAD with correct flags
+    // AAD structure: version(1) + flags(1) + seqNum(4) + timestamp(8) + header(41) = 55 bytes
+    // Header starts at offset 14 (not 15!)
     const aad = new Uint8Array(1 + 1 + 4 + 8 + ROUTING_HEADER_SIZE);
     aad[0] = FRAME_VERSION;
     aad[1] = flags;
     const aadView = new DataView(aad.buffer);
     aadView.setUint32(2, seqNum, false);
     aadView.setBigUint64(6, BigInt(timestamp), false);
-    aad.set(headerBytes, 15);
+    aad.set(headerBytes, 14); // Correct offset: 1+1+4+8 = 14
 
     // Build nonce: nonceBase[0:4] + seqNum(4) + random(4)
+    // Safety check: ensure nonceBase is valid
+    if (!this.nonceBase || this.nonceBase.byteLength < 4) {
+      throw new Error('nonceBase not initialized or too short');
+    }
     const nonce = new Uint8Array(GCM_NONCE_LENGTH);
-    nonce.set(new Uint8Array(this.nonceBase, 0, 4), 0);
+    nonce.set(new Uint8Array(this.nonceBase).subarray(0, 4), 0);
     const nonceView = new DataView(nonce.buffer);
     nonceView.setUint32(4, seqNum, false);
     crypto.getRandomValues(nonce.subarray(8, 12));
@@ -304,8 +312,11 @@ export class CryptoSession {
     if (version !== FRAME_VERSION) throw new Error(`unsupported version: ${version}`);
 
     const flags = data[1];
-    const seqNum = new DataView(data.buffer).getUint32(2, false);
-    const timestamp = Number(new DataView(data.buffer).getBigUint64(6, false));
+    // Use DataView on the underlying buffer with correct byteOffset
+    // (data may be a view with non-zero byteOffset)
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const seqNum = view.getUint32(2, false);
+    const timestamp = Number(view.getBigUint64(6, false));
 
     const isDummy = (flags & FLAG_IS_DUMMY) !== 0;
 
@@ -315,9 +326,9 @@ export class CryptoSession {
     }
     this.lastRecvSeq = seqNum;
 
-    // Timestamp skew check (300s)
+    // Timestamp skew check (900s = 15min)
     const now = Date.now();
-    if (Math.abs(now - timestamp) > 300000) {
+    if (Math.abs(now - timestamp) > 900000) {
       throw new Error(`timestamp skew: ${Math.abs(now - timestamp)}ms`);
     }
 
@@ -336,12 +347,15 @@ export class CryptoSession {
     }
 
     // Build AAD
+    // AAD structure: version(1) + flags(1) + seqNum(4) + timestamp(8) + header(41) = 55 bytes
+    // Header starts at offset 14 (not 15!)
     const aad = new Uint8Array(1 + 1 + 4 + 8 + ROUTING_HEADER_SIZE);
     aad[0] = version;
     aad[1] = flags;
-    new DataView(aad.buffer).setUint32(2, seqNum, false);
-    new DataView(aad.buffer).setBigUint64(6, BigInt(timestamp), false);
-    aad.set(headerBytes, 15);
+    const aadView = new DataView(aad.buffer);
+    aadView.setUint32(2, seqNum, false);
+    aadView.setBigUint64(6, BigInt(timestamp), false);
+    aad.set(headerBytes, 14); // Correct offset: 1+1+4+8 = 14
 
     // Extract encrypted payload
     let payloadStart = 15 + ROUTING_HEADER_SIZE + 16;
@@ -349,7 +363,8 @@ export class CryptoSession {
 
     // Check for padding
     if (flags & FLAG_HAS_PADDING) {
-      const paddingLen = new DataView(data.buffer).getUint16(data.length - 2, false);
+      // Use view (with correct byteOffset) to read padding length
+      const paddingLen = view.getUint16(data.length - 2, false);
       payloadEnd = data.length - paddingLen - 2;
     }
 
@@ -380,10 +395,13 @@ export class CryptoSession {
   }
 
   private async computeHeaderMAC(headerBytes: Uint8Array): Promise<ArrayBuffer> {
-    const full = await crypto.subtle.sign('HMAC', this.hmacKey, headerBytes.buffer.slice(0));
+    // Web Crypto API sign() accepts ArrayBufferView (Uint8Array), which handles byteOffset correctly
+    const full = await crypto.subtle.sign('HMAC', this.hmacKey, headerBytes);
     // Truncate to 128 bits and ensure it's ArrayBuffer (not ArrayBufferLike)
     const truncated = new Uint8Array(full).slice(0, 16);
-    return truncated.buffer as ArrayBuffer;
+    // slice() creates a view, but we need the underlying buffer
+    // Use slice() on the ArrayBuffer to get an independent copy
+    return truncated.buffer.slice(truncated.byteOffset, truncated.byteOffset + truncated.byteLength);
   }
 
   /**
@@ -415,10 +433,14 @@ export class CryptoSession {
     aad[1] = flags;
     new DataView(aad.buffer).setUint32(2, seqNum, false);
     new DataView(aad.buffer).setBigUint64(6, BigInt(timestamp), false);
-    aad.set(headerBytes, 15);
+    aad.set(headerBytes, 14); // Correct offset: 1+1+4+8 = 14
 
+    // Safety check: ensure nonceBase is valid
+    if (!this.nonceBase || this.nonceBase.byteLength < 4) {
+      throw new Error('nonceBase not initialized or too short');
+    }
     const nonce = new Uint8Array(GCM_NONCE_LENGTH);
-    nonce.set(new Uint8Array(this.nonceBase, 0, 4), 0);
+    nonce.set(new Uint8Array(this.nonceBase).subarray(0, 4), 0);
     new DataView(nonce.buffer).setUint32(4, seqNum, false);
     crypto.getRandomValues(nonce.subarray(8, 12));
 

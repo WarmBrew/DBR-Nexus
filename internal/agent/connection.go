@@ -41,6 +41,8 @@ type Client struct {
 	session      *svcrypto.Session // nil = cleartext mode
 	deviceAlias  uint32
 	obfuscator   *svcrypto.Obfuscator
+	stopCh       chan struct{}   // signals all goroutines to stop
+	wg           sync.WaitGroup  // tracks running goroutines
 }
 
 // NewClient creates a new WebSocket client
@@ -53,15 +55,23 @@ func NewClient(serverURL, psk, deviceID string, logger *zap.Logger) *Client {
 		sendCh:    make(chan *protocol.Envelope, 256),
 		rawSendCh: make(chan []byte, 64),
 		logger:    logger,
+		stopCh:    make(chan struct{}),
 	}
 }
 
 // Connect establishes a WebSocket connection and performs PSK authentication
 func (c *Client) Connect(ctx context.Context) error {
+	// Stop any previous goroutines before starting new connection
+	c.stopAllGoroutines()
+
 	c.mu.Lock()
 	c.closed = false
 	c.session = nil
 	c.deviceAlias = 0
+	// Create new stop channel and send channels for this connection
+	c.stopCh = make(chan struct{})
+	c.sendCh = make(chan *protocol.Envelope, 256)
+	c.rawSendCh = make(chan []byte, 64)
 	c.mu.Unlock()
 
 	dialer := &websocket.Dialer{
@@ -288,7 +298,8 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-	// Start message pumps
+	// Start message pumps with WaitGroup tracking
+	c.wg.Add(3)
 	go c.readPump()
 	go c.writePump()
 	go c.pingLoop()
@@ -371,18 +382,42 @@ func (c *Client) OnDisconnect(fn func()) {
 	c.onDisconnect = append(c.onDisconnect, fn)
 }
 
-// Close closes the connection
-func (c *Client) Close() error {
+// stopAllGoroutines signals all running goroutines to stop and waits for them
+func (c *Client) stopAllGoroutines() {
 	c.mu.Lock()
-	c.closed = true
+	stopCh := c.stopCh
+	if stopCh != nil {
+		select {
+		case <-stopCh:
+			// Already closed
+		default:
+			close(stopCh)
+		}
+	}
 	c.mu.Unlock()
 
+	// Wait for all goroutines to finish
+	c.wg.Wait()
+
+	// Stop obfuscator if running
 	if c.obfuscator != nil {
 		c.obfuscator.Stop()
+		c.obfuscator = nil
 	}
+}
 
-	if c.conn != nil {
-		return c.conn.Close()
+// Close closes the connection
+func (c *Client) Close() error {
+	c.stopAllGoroutines()
+
+	c.mu.Lock()
+	c.closed = true
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
+
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }
@@ -436,10 +471,17 @@ func (c *Client) ConnectWithRetry(ctx context.Context, cfg ReconnectConfig) erro
 // readPump reads messages from the server
 func (c *Client) readPump() {
 	defer func() {
+		c.wg.Done()
 		c.mu.Lock()
 		wasClosed := c.closed
 		c.closed = true
+		conn := c.conn
+		c.conn = nil
 		c.mu.Unlock()
+
+		if conn != nil {
+			conn.Close()
+		}
 
 		if !wasClosed {
 			for _, cb := range c.onDisconnect {
@@ -506,9 +548,13 @@ func (c *Client) readPump() {
 
 // writePump writes messages to the server
 func (c *Client) writePump() {
+	defer c.wg.Done()
+
 	for {
 		// Priority: real messages over dummy frames
 		select {
+		case <-c.stopCh:
+			return
 		case env, ok := <-c.sendCh:
 			if !ok {
 				return
@@ -522,6 +568,8 @@ func (c *Client) writePump() {
 		}
 
 		select {
+		case <-c.stopCh:
+			return
 		case env, ok := <-c.sendCh:
 			if !ok {
 				return
@@ -567,9 +615,18 @@ func (c *Client) writeEnvelope(env *protocol.Envelope) error {
 // to avoid concurrent WebSocket writes from multiple goroutines.
 func (c *Client) pingLoop() {
 	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		c.wg.Done()
+	}()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+		}
+
 		c.mu.Lock()
 		if c.closed || c.conn == nil {
 			c.mu.Unlock()
@@ -588,6 +645,8 @@ func (c *Client) pingLoop() {
 		// Send WebSocket protocol-level ping through writePump channel
 		// to avoid concurrent write with writePump
 		select {
+		case <-c.stopCh:
+			return
 		case c.sendCh <- &protocol.Envelope{
 			ID:        "__ping__",
 			Type:      protocol.TypeRequest,

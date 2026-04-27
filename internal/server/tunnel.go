@@ -103,9 +103,14 @@ type tunnelByteCounter struct {
 	recv atomic.Int64 // bytes received from agent to server (downlink)
 }
 
-// AddTunnelBytes updates the byte counters for a tunnel
+// AddTunnelBytes updates the byte counters for a tunnel.
+// Uses Load instead of LoadOrStore so that deleted entries are NOT recreated
+// by relay goroutines that are still running after tunnel closure.
 func AddTunnelBytes(tunnelID string, sent, recv int64) {
-	val, _ := tunnelBytes.LoadOrStore(tunnelID, &tunnelByteCounter{})
+	val, ok := tunnelBytes.Load(tunnelID)
+	if !ok {
+		return // tunnel already closed/removed — discard stats
+	}
 	counter := val.(*tunnelByteCounter)
 	if sent > 0 {
 		counter.sent.Add(sent)
@@ -149,8 +154,12 @@ func (h *Hub) relayTunnelConnection(tunnelID, deviceID, connID string, conn net.
 	// Register connection so agent responses can be routed back to this TCP connection
 	connKey := tunnelID + ":" + connID
 	tunnelConns.Store(connKey, conn)
+	// Track connection per device for cleanup on disconnect
+	deviceConns, _ := tunnelDeviceConns.LoadOrStore(deviceID, &sync.Map{})
+	deviceConns.(*sync.Map).Store(connKey, conn)
 	defer func() {
 		tunnelConns.Delete(connKey)
+		deviceConns.(*sync.Map).Delete(connKey)
 		conn.Close()
 		// Notify agent to close the remote connection
 		closeEnv, _ := protocol.NewEnvelope(

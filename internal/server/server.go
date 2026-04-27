@@ -82,6 +82,7 @@ func New(cfg *Config, db *database.DB, logger *zap.Logger) *Server {
 
 	hub.OnAgentConnect = s.onAgentConnect
 	hub.OnAgentDisconnect = s.onAgentDisconnect
+	hub.BeforeAgentRegister = s.closeTunnelListenersForDevice
 
 	return s
 }
@@ -821,6 +822,8 @@ func (s *Server) handleCreateTunnel(c *gin.Context) {
 		return
 	}
 	s.tunnelListeners.Store(tunnelID, ln)
+	// Pre-initialize tunnelBytes entry so AddTunnelBytes works immediately
+	tunnelBytes.Store(tunnelID, &tunnelByteCounter{})
 	go s.hub.ServeTunnelListener(tunnelID, req.DeviceID, ln)
 
 	// Start auto-close timer
@@ -943,6 +946,8 @@ func (s *Server) handleCreateSocks5(c *gin.Context) {
 		return
 	}
 	s.tunnelListeners.Store(tunnelID, ln)
+	// Pre-initialize tunnelBytes entry so AddTunnelBytes works immediately
+	tunnelBytes.Store(tunnelID, &tunnelByteCounter{})
 	go s.hub.ServeSocks5Listener(tunnelID, req.DeviceID, ln, req.Socks5User, req.Socks5Pass, req.AllowedIPs)
 
 	// Start auto-close timer
@@ -1671,6 +1676,40 @@ func (s *Server) onAgentDisconnect(deviceID string) {
 	s.db.UpdateDeviceStatus(ctx, deviceID, "offline")
 	event, _ := protocol.NewEvent(protocol.ChannelSystem, protocol.ActionDeviceOffline, protocol.DeviceOfflinePayload{DeviceID: deviceID, Reason: "connection lost", DisconnectedAt: time.Now().UnixMilli()})
 	s.hub.BroadcastEvent(event)
+	// Clean up device connections and tunnel listeners on disconnect
+	s.hub.CleanupDeviceConns(deviceID)
+	s.closeTunnelListenersForDevice(deviceID)
+}
+
+// closeTunnelListenersForDevice closes all tunnel listeners associated with a device.
+// Called both when an agent disconnects and when a replacement agent registers.
+func (s *Server) closeTunnelListenersForDevice(deviceID string) {
+	tunnels, err := s.db.ListActiveTunnelsWithExpiry(context.Background())
+	if err != nil {
+		return
+	}
+	for _, t := range tunnels {
+		if t.DeviceID != deviceID {
+			continue
+		}
+		// Stop auto-close timer
+		s.stopTunnelTimer(t.ID)
+		// Close listener
+		if ln, ok := s.tunnelListeners.LoadAndDelete(t.ID); ok {
+			ln.(net.Listener).Close()
+		}
+		// Flush tunnel byte counters
+		sent, recv := GetAndResetTunnelBytes(t.ID)
+		tunnelBytes.Delete(t.ID)
+		if sent > 0 || recv > 0 {
+			s.db.UpdateTunnelStats(context.Background(), t.ID, sent, recv)
+		}
+		// Release port and close in DB
+		s.portPool.Release(t.LocalAddr)
+		s.db.CloseTunnel(context.Background(), t.ID)
+		s.logger.Info("closed tunnel for disconnected/replacing agent",
+			zap.String("tunnel_id", t.ID), zap.String("device_id", deviceID))
+	}
 }
 
 // ---- Helper: proxy request to device ----

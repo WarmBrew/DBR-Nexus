@@ -112,8 +112,9 @@ type Hub struct {
 	logger *zap.Logger
 
 	// Callbacks for agent connect/disconnect
-	OnAgentConnect    func(deviceID string, conn *AgentConn)
-	OnAgentDisconnect func(deviceID string)
+	OnAgentConnect      func(deviceID string, conn *AgentConn)
+	OnAgentDisconnect   func(deviceID string)
+	BeforeAgentRegister func(deviceID string) // called before new agent is stored (for server cleanup)
 }
 
 // NewHub creates a new Hub
@@ -125,6 +126,14 @@ func NewHub(logger *zap.Logger) *Hub {
 
 // RegisterAgent registers an agent connection
 func (h *Hub) RegisterAgent(conn *AgentConn) {
+	// Clean up stale connections/listeners from previous agent session.
+	// This handles the race where a new agent connects before the old
+	// agent's UnregisterAgent runs.
+	h.CleanupDeviceConns(conn.DeviceID)
+	if h.BeforeAgentRegister != nil {
+		h.BeforeAgentRegister(conn.DeviceID)
+	}
+
 	// Store device alias mapping
 	if conn.DeviceAlias != 0 {
 		h.deviceAliases.Store(conn.DeviceAlias, conn.DeviceID)
@@ -215,6 +224,33 @@ func (h *Hub) UnregisterBrowser(connID string) {
 		browserConn := conn.(*BrowserConn)
 		browserConn.Conn.Close()
 		h.logger.Info("browser unregistered", zap.String("conn_id", connID))
+	}
+}
+
+// CleanupDeviceConns closes all SOCKS5 and tunnel TCP connections for a device.
+// Uses LoadAndDelete so it runs exactly once even if called from multiple places
+// (RegisterAgent and onAgentDisconnect).
+func (h *Hub) CleanupDeviceConns(deviceID string) {
+	// Close all SOCKS5 connections for this device
+	if conns, ok := socks5DeviceConns.LoadAndDelete(deviceID); ok {
+		conns.(*sync.Map).Range(func(key, value interface{}) bool {
+			connID := key.(string)
+			conn := value.(net.Conn)
+			socks5Conns.Delete(connID)
+			socks5ConnTunnel.Delete(connID)
+			conn.Close()
+			return true
+		})
+	}
+	// Close all tunnel connections for this device
+	if conns, ok := tunnelDeviceConns.LoadAndDelete(deviceID); ok {
+		conns.(*sync.Map).Range(func(key, value interface{}) bool {
+			connKey := key.(string)
+			conn := value.(net.Conn)
+			tunnelConns.Delete(connKey)
+			conn.Close()
+			return true
+		})
 	}
 }
 
@@ -696,6 +732,12 @@ var socks5Conns sync.Map // connID -> net.Conn
 // socks5ConnTunnel maps SOCKS5 connID to tunnelID for traffic statistics
 var socks5ConnTunnel sync.Map // connID -> tunnelID
 
+// socks5DeviceConns tracks SOCKS5 connections per device for cleanup on disconnect
+var socks5DeviceConns sync.Map // deviceID -> *sync.Map (connID -> net.Conn)
+
+// tunnelDeviceConns tracks tunnel connections per device for cleanup on disconnect
+var tunnelDeviceConns sync.Map // deviceID -> *sync.Map (connKey -> net.Conn)
+
 type hubError struct {
 	code    int
 	message string
@@ -862,9 +904,13 @@ func (h *Hub) handleSocks5Connection(tunnelID, deviceID string, conn net.Conn, s
 
 	socks5Conns.Store(connID, conn)
 	socks5ConnTunnel.Store(connID, tunnelID)
+	// Track connection per device for cleanup on disconnect
+	deviceConns, _ := socks5DeviceConns.LoadOrStore(deviceID, &sync.Map{})
+	deviceConns.(*sync.Map).Store(connID, conn)
 	defer func() {
 		socks5Conns.Delete(connID)
 		socks5ConnTunnel.Delete(connID)
+		deviceConns.(*sync.Map).Delete(connID)
 	}()
 
 	relayBuf := make([]byte, 32*1024)

@@ -1,5 +1,5 @@
-import { useMemo, useEffect, useCallback } from 'react';
-import { Progress, Typography, Tooltip, Button } from 'antd';
+import { useMemo, useEffect } from 'react';
+import { Progress, Typography, Tooltip, Button, Badge } from 'antd';
 import { CloudUploadOutlined, CloseOutlined, CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
 import useUploadStore, { UploadTask } from '../../store/uploadSlice';
 
@@ -72,6 +72,54 @@ function TaskItem({
         </Text>
       )}
     </div>
+  );
+}
+
+// Inline variant: compact display for toolbar
+export function InlineUploadProgress({ deviceId }: { deviceId?: string }) {
+  const { tasks } = useUploadStore();
+
+  // Filter tasks by deviceId if provided
+  const activeTasks = useMemo(() => {
+    const filtered = deviceId ? tasks.filter(t => t.deviceId === deviceId) : tasks;
+    return filtered.filter(t => t.status === 'uploading');
+  }, [tasks, deviceId]);
+
+  if (activeTasks.length === 0) return null;
+
+  // Show first active task with progress
+  const currentTask = activeTasks[0];
+  
+  return (
+    <Tooltip 
+      title={
+        <div>
+          {activeTasks.map(t => (
+            <div key={t.id} style={{ marginBottom: 4 }}>
+              {t.name}: {t.percent}%
+            </div>
+          ))}
+        </div>
+      }
+    >
+      <Badge 
+        count={activeTasks.length > 1 ? activeTasks.length : 0} 
+        size="small"
+        color="#52c41a"
+      >
+        <Button 
+          size="small" 
+          icon={<CloudUploadOutlined spin />}
+          style={{ 
+            background: '#2d2d2d',
+            borderColor: '#3c3c3c',
+            color: '#52c41a',
+          }}
+        >
+          <span style={{ marginLeft: 4 }}>{currentTask.percent}%</span>
+        </Button>
+      </Badge>
+    </Tooltip>
   );
 }
 

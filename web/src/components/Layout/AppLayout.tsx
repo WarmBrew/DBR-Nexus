@@ -13,7 +13,6 @@ import {
 } from '@ant-design/icons';
 import { useAuthStore } from '../../store/authSlice';
 import wsManager from '../../api/ws';
-import UploadProgressPanel from './UploadProgressPanel';
 
 const { Header, Sider, Content } = Layout;
 
@@ -80,8 +79,6 @@ export default function AppLayout() {
           <DesktopOutlined style={{ fontSize: 24, color: themeToken.colorPrimary }} />
           {!collapsed && <span style={{ marginLeft: 8, fontSize: 16, fontWeight: 600, color: '#cccccc' }}>DBR Nexus</span>}
         </div>
-        {/* Upload progress panel - show when not collapsed */}
-        {!collapsed && <UploadProgressPanel />}
         <Menu
           mode="inline"
           theme="dark"

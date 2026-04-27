@@ -26,14 +26,14 @@ database:
 auth:
   # JWT signing secret. MUST be changed for production.
   # Use a long random string (e.g., openssl rand -hex 32).
-  jwt_secret: "change-me-in-production"
+  jwt_secret: "3d9178064ecd67880cfbe6cc25b720a6847a8e1e8abbaef4b4b0d110ace2f648"
 
   # JWT token expiry duration.
   jwt_expiry: 24h
 
   # Pre-Shared Key for agent authentication.
   # Must match the PSK configured in the agent's config file.
-  psk: "default-psk"
+  psk: "0d1528deac7056a586856027cf1caada"
 
 # --- Logging ---
 logging:

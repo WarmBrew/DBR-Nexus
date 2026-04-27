@@ -89,6 +89,9 @@ func (o *Obfuscator) RandomInterval() time.Duration {
 	o.mu.Lock()
 	minMs := o.config.MinDummyInterval
 	maxMs := o.config.MaxDummyInterval
+	if maxMs < minMs {
+		maxMs = minMs
+	}
 	interval := minMs + o.rng.Intn(maxMs-minMs+1)
 	o.mu.Unlock()
 	return time.Duration(interval) * time.Millisecond

@@ -58,6 +58,37 @@ type BrowserConn struct {
 	WatchMu      sync.RWMutex      // protects Watching map
 	Session      *svcrypto.Session // nil = cleartext mode
 	BrowserAlias uint32
+	sendMu       sync.Mutex // protects Send channel from concurrent close+send
+	sendClosed   bool       // true after CloseSend
+	closeOnce    sync.Once  // protects CloseSend from double close
+}
+
+// CloseSend safely closes the Send channel (idempotent)
+func (bc *BrowserConn) CloseSend() {
+	bc.closeOnce.Do(func() {
+		bc.sendMu.Lock()
+		bc.sendClosed = true
+		close(bc.Send)
+		bc.sendMu.Unlock()
+	})
+}
+
+// SafeSend sends an envelope to the browser, returning false if the connection is closed or buffer full.
+// This is safe to call concurrently and will never panic on a closed channel.
+func (bc *BrowserConn) SafeSend(env *protocol.Envelope) bool {
+	bc.sendMu.Lock()
+	if bc.sendClosed {
+		bc.sendMu.Unlock()
+		return false
+	}
+	select {
+	case bc.Send <- env:
+		bc.sendMu.Unlock()
+		return true
+	default:
+		bc.sendMu.Unlock()
+		return false
+	}
 }
 
 // Hub maintains the set of active agent and browser connections
@@ -205,14 +236,15 @@ func (h *Hub) SendToDevice(deviceID string, env *protocol.Envelope) error {
 
 // RequestToDevice sends a request and waits for response
 func (h *Hub) RequestToDevice(deviceID string, env *protocol.Envelope, timeout time.Duration) (*protocol.Envelope, error) {
-	if err := h.SendToDevice(deviceID, env); err != nil {
-		return nil, err
-	}
-
+	// Register pending BEFORE sending to avoid TOCTOU race
 	pendingKey := deviceID + ":" + env.ID
 	respCh := make(chan *protocol.Envelope, 1)
 	h.pendingRequests.Store(pendingKey, respCh)
 	defer h.pendingRequests.Delete(pendingKey)
+
+	if err := h.SendToDevice(deviceID, env); err != nil {
+		return nil, err
+	}
 
 	select {
 	case resp := <-respCh:
@@ -230,13 +262,7 @@ func (h *Hub) BroadcastToWatchers(deviceID string, env *protocol.Envelope) {
 		watching := browserConn.Watching[deviceID]
 		browserConn.WatchMu.RUnlock()
 		if watching {
-			select {
-			case browserConn.Send <- env:
-			default:
-				h.logger.Warn("browser send buffer full, dropping event",
-					zap.String("conn_id", browserConn.ID),
-					zap.String("device_id", deviceID))
-			}
+			browserConn.SafeSend(env)
 		}
 		return true
 	})
@@ -246,10 +272,7 @@ func (h *Hub) BroadcastToWatchers(deviceID string, env *protocol.Envelope) {
 func (h *Hub) BroadcastEvent(env *protocol.Envelope) {
 	h.browsers.Range(func(key, value interface{}) bool {
 		browserConn := value.(*BrowserConn)
-		select {
-		case browserConn.Send <- env:
-		default:
-		}
+		browserConn.SafeSend(env)
 		return true
 	})
 }
@@ -421,7 +444,7 @@ func (h *Hub) readAgentPump(conn *AgentConn) {
 
 func (h *Hub) readBrowserPump(conn *BrowserConn) {
 	defer func() {
-		close(conn.Send)
+		conn.CloseSend()
 		h.UnregisterBrowser(conn.ID)
 	}()
 
@@ -461,10 +484,7 @@ func (h *Hub) readBrowserPump(conn *BrowserConn) {
 						Payload:   json.RawMessage(fmt.Sprintf(`{"ping_ts":%d}`, pingPayload.PingTs)),
 						Timestamp: time.Now().UnixMilli(),
 					}
-					select {
-					case conn.Send <- pongEnv:
-					default:
-					}
+					conn.SafeSend(pongEnv)
 					continue
 				}
 				h.handleBrowserMessage(conn, env)
@@ -491,10 +511,7 @@ func (h *Hub) readBrowserPump(conn *BrowserConn) {
 						Timestamp: time.Now().UnixMilli(),
 						Payload:   json.RawMessage(pong),
 					}
-					select {
-					case conn.Send <- pongEnv:
-					default:
-					}
+					conn.SafeSend(pongEnv)
 				}
 				continue
 			}
@@ -528,10 +545,14 @@ func (h *Hub) handleAgentMessage(conn *AgentConn, env *protocol.Envelope) {
 		if env.Action == protocol.ActionSocks5Data {
 			var payload protocol.Socks5DataPayload
 			if env.DecodePayload(&payload) == nil {
-				if rawConn, ok := socks5Conns.Load(payload.ConnID); ok {
-					decoded, err := base64.StdEncoding.DecodeString(payload.Data)
-					if err == nil {
-						rawConn.(net.Conn).Write(decoded)
+				decoded, err := base64.StdEncoding.DecodeString(payload.Data)
+				if err == nil && len(decoded) > 0 {
+					if rawConn, ok := socks5Conns.Load(payload.ConnID); ok {
+						n, _ := rawConn.(net.Conn).Write(decoded)
+						// Record downlink traffic for SOCKS5 tunnel
+						if tunnelID, ok := socks5ConnTunnel.Load(payload.ConnID); ok {
+							AddTunnelBytes(tunnelID.(string), 0, int64(n))
+						}
 					}
 				}
 			}
@@ -562,10 +583,15 @@ func (h *Hub) handleAgentMessage(conn *AgentConn, env *protocol.Envelope) {
 			}
 			if env.DecodePayload(&chunkPayload) == nil && chunkPayload.TransferID != "" {
 				if ch, ok := h.downloadStreams.Load(chunkPayload.TransferID); ok {
-					ch.(chan downloadChunk) <- downloadChunk{
+					select {
+					case ch.(chan downloadChunk) <- downloadChunk{
 						Action:     env.Action,
 						TransferID: chunkPayload.TransferID,
 						Data:       chunkPayload.Data,
+					}:
+					default:
+						h.logger.Warn("download stream buffer full, dropping chunk",
+							zap.String("transfer_id", chunkPayload.TransferID))
 					}
 				}
 			}
@@ -579,9 +605,12 @@ func (h *Hub) handleAgentMessage(conn *AgentConn, env *protocol.Envelope) {
 			}
 			if env.DecodePayload(&donePayload) == nil && donePayload.TransferID != "" {
 				if ch, ok := h.downloadStreams.Load(donePayload.TransferID); ok {
-					ch.(chan downloadChunk) <- downloadChunk{
+					select {
+					case ch.(chan downloadChunk) <- downloadChunk{
 						Action:     env.Action,
 						TransferID: donePayload.TransferID,
+					}:
+					default:
 					}
 				}
 			}
@@ -593,10 +622,8 @@ func (h *Hub) handleAgentMessage(conn *AgentConn, env *protocol.Envelope) {
 func (h *Hub) forwardToAllBrowsers(env *protocol.Envelope) {
 	h.browsers.Range(func(key, value interface{}) bool {
 		browserConn := value.(*BrowserConn)
-		select {
-		case browserConn.Send <- env:
-		default:
-			h.logger.Warn("browser send buffer full, dropping stream",
+		if !browserConn.SafeSend(env) {
+			h.logger.Debug("browser send skipped, connection closed or buffer full",
 				zap.String("conn_id", browserConn.ID))
 		}
 		return true
@@ -616,38 +643,42 @@ func (h *Hub) handleBrowserMessage(conn *BrowserConn, env *protocol.Envelope) {
 		DeviceID string `json:"device_id"`
 	}
 	if err := env.DecodePayload(&payload); err == nil && payload.DeviceID != "" {
-		if err := h.SendToDevice(payload.DeviceID, env); err != nil {
-			errResp := protocol.NewErrorResponse(env, 503, err.Error())
-			select {
-			case conn.Send <- errResp:
-			default:
-			}
-		}
 		needsResponse := env.Type == protocol.TypeRequest &&
 			env.Action != protocol.ActionShellInput &&
 			env.Action != protocol.ActionShellResize &&
 			env.Action != protocol.ActionTunnelData
 
+		// If a response is needed, register the pending channel BEFORE sending
+		// to avoid the TOCTOU race where the response arrives before we register.
 		if needsResponse {
 			pendingKey := payload.DeviceID + ":" + env.ID
 			respCh := make(chan *protocol.Envelope, 1)
 			h.pendingRequests.Store(pendingKey, respCh)
 
+			if err := h.SendToDevice(payload.DeviceID, env); err != nil {
+				// Send failed: clean up pending and notify browser
+				h.pendingRequests.Delete(pendingKey)
+				errResp := protocol.NewErrorResponse(env, 503, err.Error())
+				conn.SafeSend(errResp)
+				return
+			}
+
 			go func() {
 				select {
 				case resp := <-respCh:
-					select {
-					case conn.Send <- resp:
-					default:
-					}
+					conn.SafeSend(resp)
 				case <-time.After(30 * time.Second):
+					h.pendingRequests.Delete(pendingKey)
 					errResp := protocol.NewErrorResponse(env, 504, "request timeout")
-					select {
-					case conn.Send <- errResp:
-					default:
-					}
+					conn.SafeSend(errResp)
 				}
 			}()
+		} else {
+			// Fire-and-forget: no response needed
+			if err := h.SendToDevice(payload.DeviceID, env); err != nil {
+				errResp := protocol.NewErrorResponse(env, 503, err.Error())
+				conn.SafeSend(errResp)
+			}
 		}
 	}
 }
@@ -661,6 +692,9 @@ var (
 
 // socks5Conns tracks active SOCKS5 connections for routing data back
 var socks5Conns sync.Map // connID -> net.Conn
+
+// socks5ConnTunnel maps SOCKS5 connID to tunnelID for traffic statistics
+var socks5ConnTunnel sync.Map // connID -> tunnelID
 
 type hubError struct {
 	code    int
@@ -690,11 +724,11 @@ func (h *Hub) ServeSocks5Listener(tunnelID, deviceID string, ln net.Listener, so
 			continue
 		}
 
-		go h.handleSocks5Connection(deviceID, conn, socks5User, socks5Pass)
+		go h.handleSocks5Connection(tunnelID, deviceID, conn, socks5User, socks5Pass)
 	}
 }
 
-func (h *Hub) handleSocks5Connection(deviceID string, conn net.Conn, socks5User, socks5Pass string) {
+func (h *Hub) handleSocks5Connection(tunnelID, deviceID string, conn net.Conn, socks5User, socks5Pass string) {
 	defer conn.Close()
 
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -827,7 +861,11 @@ func (h *Hub) handleSocks5Connection(deviceID string, conn net.Conn, socks5User,
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
 	socks5Conns.Store(connID, conn)
-	defer socks5Conns.Delete(connID)
+	socks5ConnTunnel.Store(connID, tunnelID)
+	defer func() {
+		socks5Conns.Delete(connID)
+		socks5ConnTunnel.Delete(connID)
+	}()
 
 	relayBuf := make([]byte, 32*1024)
 	for {
@@ -844,6 +882,7 @@ func (h *Hub) handleSocks5Connection(deviceID string, conn net.Conn, socks5User,
 			if err := h.SendToDevice(deviceID, dataEnv); err != nil {
 				return
 			}
+			AddTunnelBytes(tunnelID, int64(n), 0)
 		}
 		if err != nil {
 			closeEnv, _ := protocol.NewEnvelope(

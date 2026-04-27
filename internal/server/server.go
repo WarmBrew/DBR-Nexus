@@ -382,7 +382,12 @@ func (s *Server) handleFileBrowse(c *gin.Context) {
 }
 
 func (s *Server) handleFileRead(c *gin.Context) {
-	s.proxyToDevice(c, protocol.ChannelFile, protocol.ActionFileRead, protocol.FileReadPayload{Path: c.Query("path")})
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+		return
+	}
+	s.proxyToDevice(c, protocol.ChannelFile, protocol.ActionFileRead, protocol.FileReadPayload{Path: path})
 }
 
 func (s *Server) handleFileWrite(c *gin.Context) {
@@ -622,7 +627,12 @@ func (s *Server) handleFileMkdir(c *gin.Context) {
 }
 
 func (s *Server) handleFileDelete(c *gin.Context) {
-	s.proxyToDevice(c, protocol.ChannelFile, protocol.ActionFileDelete, protocol.FileDeletePayload{Path: c.Query("path")})
+	path := c.Query("path")
+	if path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path is required"})
+		return
+	}
+	s.proxyToDevice(c, protocol.ChannelFile, protocol.ActionFileDelete, protocol.FileDeletePayload{Path: path})
 }
 
 func (s *Server) handleFileMove(c *gin.Context) {
@@ -830,6 +840,13 @@ func (s *Server) handleDeleteTunnel(c *gin.Context) {
 	// Cancel auto-close timer
 	s.stopTunnelTimer(id)
 
+	// Flush and clean up tunnel byte counters
+	sent, recv := GetAndResetTunnelBytes(id)
+	tunnelBytes.Delete(id)
+	if sent > 0 || recv > 0 {
+		s.db.UpdateTunnelStats(c.Request.Context(), id, sent, recv)
+	}
+
 	// Close local TCP listener
 	if ln, ok := s.tunnelListeners.LoadAndDelete(id); ok {
 		ln.(net.Listener).Close()
@@ -1001,14 +1018,14 @@ func (s *Server) handleHardDeleteTunnel(c *gin.Context) {
 // startTunnelTimer starts an auto-close timer for the given tunnel.
 // It stops any existing timer for the same tunnelID to prevent timer leaks.
 func (s *Server) startTunnelTimer(tunnelID string, duration time.Duration) {
-	// Stop existing timer if present to avoid leaking it
-	if val, ok := s.tunnelTimers.Load(tunnelID); ok {
-		val.(*time.Timer).Stop()
-	}
+	// Create new timer first
 	timer := time.AfterFunc(duration, func() {
 		s.autoCloseTunnel(tunnelID)
 	})
-	s.tunnelTimers.Store(tunnelID, timer)
+	// Atomically swap: store new, stop old if present
+	if old, loaded := s.tunnelTimers.Swap(tunnelID, timer); loaded {
+		old.(*time.Timer).Stop()
+	}
 }
 
 // stopTunnelTimer stops and removes the auto-close timer for the given tunnel
@@ -1021,6 +1038,13 @@ func (s *Server) stopTunnelTimer(tunnelID string) {
 // autoCloseTunnel is called when a tunnel's auto-close timer fires
 func (s *Server) autoCloseTunnel(tunnelID string) {
 	s.tunnelTimers.Delete(tunnelID)
+
+	// Flush and clean up tunnel byte counters
+	sent, recv := GetAndResetTunnelBytes(tunnelID)
+	tunnelBytes.Delete(tunnelID)
+	if sent > 0 || recv > 0 {
+		s.db.UpdateTunnelStats(context.Background(), tunnelID, sent, recv)
+	}
 
 	tunnel, err := s.db.GetTunnel(context.Background(), tunnelID)
 	if err != nil || tunnel == nil || tunnel.State != "active" {
@@ -1092,7 +1116,11 @@ func (s *Server) handleCreateUser(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
 		return
 	}
-	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
 	user := &database.User{ID: uuid.New().String(), Username: req.Username, Password: string(hashedPassword), DisplayName: req.DisplayName, Role: req.Role, Enabled: true}
 	if err := s.db.CreateUser(c.Request.Context(), user); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
@@ -1122,15 +1150,30 @@ func (s *Server) handleUpdateUser(c *gin.Context) {
 		user.DisplayName = *req.DisplayName
 	}
 	if req.Role != nil {
+		validRoles := map[string]bool{"admin": true, "operator": true, "viewer": true}
+		if !validRoles[*req.Role] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role, must be admin, operator, or viewer"})
+			return
+		}
 		user.Role = *req.Role
 	}
 	if req.Enabled != nil {
 		user.Enabled = *req.Enabled
 	}
-	s.db.UpdateUser(c.Request.Context(), user)
+	if err := s.db.UpdateUser(c.Request.Context(), user); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+		return
+	}
 	if req.Password != nil {
-		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
-		s.db.UpdateUserPassword(c.Request.Context(), id, string(hashedPassword))
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+			return
+		}
+		if err := s.db.UpdateUserPassword(c.Request.Context(), id, string(hashedPassword)); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update password"})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"id": user.ID, "username": user.Username, "display_name": user.DisplayName, "role": user.Role, "enabled": user.Enabled})
 }
@@ -1146,8 +1189,17 @@ func (s *Server) handleDeleteUser(c *gin.Context) {
 // ---- Audit handler ----
 
 func (s *Server) handleAuditLogs(c *gin.Context) {
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
-	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	limit, err := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	if err != nil || limit < 1 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
 	entries, total, err := s.db.ListAuditLogs(c.Request.Context(), database.AuditFilter{
 		UserID: c.Query("user_id"), DeviceID: c.Query("device_id"), Action: c.Query("action"),
 		From: c.Query("from"), To: c.Query("to"), Limit: limit, Offset: offset,
@@ -1308,11 +1360,23 @@ func (s *Server) agentEncryptedHandshake(conn *websocket.Conn, c *gin.Context) {
 		// Signal encryption start then send encrypted confirm
 		helloMsg := map[string]string{"type": "encryption_start", "challenge_id": challenge.ID}
 		helloData, _ := json.Marshal(helloMsg)
-		conn.WriteMessage(websocket.TextMessage, helloData)
-		conn.WriteMessage(websocket.BinaryMessage, frame)
+		if err := conn.WriteMessage(websocket.TextMessage, helloData); err != nil {
+			s.logger.Error("failed to send encryption_start", zap.Error(err))
+			conn.Close()
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			s.logger.Error("failed to send encrypted key confirm", zap.Error(err))
+			conn.Close()
+			return
+		}
 	} else {
 		successData, _ := json.Marshal(authSuccess)
-		conn.WriteMessage(websocket.TextMessage, successData)
+		if err := conn.WriteMessage(websocket.TextMessage, successData); err != nil {
+			s.logger.Error("failed to send auth success", zap.Error(err))
+			conn.Close()
+			return
+		}
 	}
 
 	// Upsert device
@@ -1794,7 +1858,7 @@ type agentBuildParams struct {
 // buildAgentBinary cross-compiles an agent binary and returns the temp file path.
 // The caller is responsible for removing the temp file.
 func (s *Server) buildAgentBinary(ctx context.Context, params agentBuildParams, isTLS bool) (tmpPath string, filename string, err error) {
-	// Build server URL - use wss:// if the request came over TLS, ws:// otherwise
+	// Build server URL - use wss:// if TLS is detected (direct or via reverse proxy)
 	serverURL := params.ServerURL
 	if !strings.HasPrefix(serverURL, "ws://") && !strings.HasPrefix(serverURL, "wss://") {
 		if isTLS {
@@ -1920,7 +1984,7 @@ func (s *Server) handleAgentBuild(c *gin.Context) {
 		Arch:      req.Arch,
 		ServerURL: req.ServerURL,
 		PSK:       req.PSK,
-	}, c.Request.TLS != nil)
+	}, c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1962,7 +2026,7 @@ func (s *Server) handleAgentDownload(c *gin.Context) {
 		Arch:      arch,
 		ServerURL: serverURL,
 		PSK:       psk,
-	}, c.Request.TLS != nil)
+	}, c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

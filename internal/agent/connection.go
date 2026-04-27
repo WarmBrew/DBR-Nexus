@@ -41,8 +41,8 @@ type Client struct {
 	session      *svcrypto.Session // nil = cleartext mode
 	deviceAlias  uint32
 	obfuscator   *svcrypto.Obfuscator
-	stopCh       chan struct{}   // signals all goroutines to stop
-	wg           sync.WaitGroup  // tracks running goroutines
+	stopCh       chan struct{}  // signals all goroutines to stop
+	wg           sync.WaitGroup // tracks running goroutines
 }
 
 // NewClient creates a new WebSocket client
@@ -145,7 +145,10 @@ func (c *Client) Connect(ctx context.Context) error {
 			c.logger.Warn("failed to generate X25519 key, proceeding without encryption", zap.Error(err))
 		} else {
 			agentNonce = make([]byte, 16)
-			cryptorand.Read(agentNonce)
+			if _, err := cryptorand.Read(agentNonce); err != nil {
+				conn.Close()
+				return fmt.Errorf("generate agent nonce: %w", err)
+			}
 
 			authPayload.AgentPubKey = base64.StdEncoding.EncodeToString(agentPrivateKey.PublicKey().Bytes())
 			authPayload.AgentNonce = base64.StdEncoding.EncodeToString(agentNonce)
@@ -153,15 +156,23 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	// Send auth response
-	resp, _ := protocol.NewEnvelope(
+	resp, err := protocol.NewEnvelope(
 		challenge.ID,
 		protocol.ChannelSystem,
 		protocol.TypeResponse,
 		protocol.ActionAuthResponse,
 		authPayload,
 	)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("build auth response: %w", err)
+	}
 
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("marshal auth response: %w", err)
+	}
 	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		conn.Close()
 		return fmt.Errorf("send auth response: %w", err)
@@ -213,7 +224,11 @@ func (c *Client) Connect(ctx context.Context) error {
 					return fmt.Errorf("compute ECDH: %w", err)
 				}
 
-				serverNonce, _ := base64.StdEncoding.DecodeString(challengePayload.ServerNonce)
+				serverNonce, err := base64.StdEncoding.DecodeString(challengePayload.ServerNonce)
+				if err != nil {
+					conn.Close()
+					return fmt.Errorf("decode server nonce: %w", err)
+				}
 
 				// Auth tag: HMAC-SHA256(PSK, serverNonce || agentPubKey)
 				tagMAC := hmac.New(sha256.New, []byte(c.psk))
@@ -319,7 +334,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		obf.Start()
 	}
 
-	// Fire onConnect callbacks
+	// Fire onConnect callbacks (safe: callbacks are only added before Connect is called)
 	for _, cb := range c.onConnect {
 		cb()
 	}
@@ -374,15 +389,21 @@ func (c *Client) Request(ctx context.Context, env *protocol.Envelope, timeout ti
 
 // OnConnect registers a callback for connection events
 func (c *Client) OnConnect(fn func()) {
+	c.mu.Lock()
 	c.onConnect = append(c.onConnect, fn)
+	c.mu.Unlock()
 }
 
 // OnDisconnect registers a callback for disconnection events
 func (c *Client) OnDisconnect(fn func()) {
+	c.mu.Lock()
 	c.onDisconnect = append(c.onDisconnect, fn)
+	c.mu.Unlock()
 }
 
-// stopAllGoroutines signals all running goroutines to stop and waits for them
+// stopAllGoroutines signals all running goroutines to stop and waits for them.
+// It closes the WebSocket connection to unblock readPump, then waits for all
+// goroutines to finish.
 func (c *Client) stopAllGoroutines() {
 	c.mu.Lock()
 	stopCh := c.stopCh
@@ -394,7 +415,15 @@ func (c *Client) stopAllGoroutines() {
 			close(stopCh)
 		}
 	}
+	// Close the connection under lock to unblock readPump's ReadMessage
+	conn := c.conn
+	c.conn = nil
 	c.mu.Unlock()
+
+	// Close the connection BEFORE wg.Wait() so readPump can exit
+	if conn != nil {
+		conn.Close()
+	}
 
 	// Wait for all goroutines to finish
 	c.wg.Wait()
@@ -412,13 +441,8 @@ func (c *Client) Close() error {
 
 	c.mu.Lock()
 	c.closed = true
-	conn := c.conn
-	c.conn = nil
 	c.mu.Unlock()
 
-	if conn != nil {
-		return conn.Close()
-	}
 	return nil
 }
 
@@ -484,14 +508,25 @@ func (c *Client) readPump() {
 		}
 
 		if !wasClosed {
-			for _, cb := range c.onDisconnect {
+			c.mu.Lock()
+			callbacks := make([]func(), len(c.onDisconnect))
+			copy(callbacks, c.onDisconnect)
+			c.mu.Unlock()
+			for _, cb := range callbacks {
 				cb()
 			}
 		}
 	}()
 
 	for {
-		msgType, message, err := c.conn.ReadMessage()
+		c.mu.Lock()
+		conn := c.conn
+		c.mu.Unlock()
+		if conn == nil {
+			return
+		}
+
+		msgType, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				c.logger.Error("read error", zap.Error(err))
@@ -501,7 +536,7 @@ func (c *Client) readPump() {
 			return
 		}
 
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 		var env *protocol.Envelope
 
@@ -527,11 +562,16 @@ func (c *Client) readPump() {
 			env = &parsed
 		}
 
-		// Route to pending request if it's a response
+		// Route to pending request if it's a response (non-blocking send while holding lock)
 		if env.Type == protocol.TypeResponse || env.Type == protocol.TypeStream {
 			c.mu.Lock()
 			if ch, ok := c.pending[env.ID]; ok {
-				ch <- env
+				select {
+				case ch <- env:
+				default:
+					c.logger.Warn("pending response channel full, dropping message",
+						zap.String("id", env.ID))
+				}
 				if env.Type == protocol.TypeResponse {
 					delete(c.pending, env.ID)
 				}
@@ -540,7 +580,7 @@ func (c *Client) readPump() {
 		}
 
 		// Dispatch to agent handler
-		if handler := c.getHandler(); handler != nil {
+		if handler := getHandler(); handler != nil {
 			go handler(env)
 		}
 	}
@@ -582,7 +622,13 @@ func (c *Client) writePump() {
 			if !ok {
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, rawFrame); err != nil {
+			c.mu.Lock()
+			conn := c.conn
+			c.mu.Unlock()
+			if conn == nil {
+				return
+			}
+			if err := conn.WriteMessage(websocket.BinaryMessage, rawFrame); err != nil {
 				c.logger.Error("raw send error", zap.Error(err))
 				return
 			}
@@ -592,9 +638,16 @@ func (c *Client) writePump() {
 
 // writeEnvelope encrypts (if session exists) and writes a single envelope
 func (c *Client) writeEnvelope(env *protocol.Envelope) error {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("connection closed")
+	}
+
 	// Special handling for internal keepalive ping
 	if env.ID == "__ping__" {
-		return c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+		return conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
 	}
 
 	if c.session != nil {
@@ -602,13 +655,13 @@ func (c *Client) writeEnvelope(env *protocol.Envelope) error {
 		if err != nil {
 			return fmt.Errorf("encrypt: %w", err)
 		}
-		return c.conn.WriteMessage(websocket.BinaryMessage, frame)
+		return conn.WriteMessage(websocket.BinaryMessage, frame)
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
-	return c.conn.WriteMessage(websocket.TextMessage, data)
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // pingLoop sends periodic application-level keepalive messages via the sendCh
@@ -633,12 +686,13 @@ func (c *Client) pingLoop() {
 			return
 		}
 		lastPong := c.lastPong
+		conn := c.conn
 		c.mu.Unlock()
 
 		// Check for stale connection before sending
 		if !lastPong.IsZero() && time.Since(lastPong) > 90*time.Second {
 			c.logger.Warn("no pong received for 90s, closing connection")
-			c.conn.Close()
+			conn.Close()
 			return
 		}
 
@@ -660,14 +714,20 @@ func (c *Client) pingLoop() {
 	}
 }
 
+// messageHandler and its synchronization
+var handlerMu sync.RWMutex
 var messageHandler func(*protocol.Envelope)
 
-func (c *Client) getHandler() func(*protocol.Envelope) {
+func getHandler() func(*protocol.Envelope) {
+	handlerMu.RLock()
+	defer handlerMu.RUnlock()
 	return messageHandler
 }
 
 // SetMessageHandler sets the global message handler
 func SetMessageHandler(fn func(*protocol.Envelope)) {
+	handlerMu.Lock()
+	defer handlerMu.Unlock()
 	messageHandler = fn
 }
 

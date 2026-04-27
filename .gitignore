@@ -6,8 +6,8 @@
 *.dylib
 dbr-server
 dbr-agent
-server
-server_linux_amd64
+./server
+./server_linux_amd64
 
 # Build directories
 bin/

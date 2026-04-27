@@ -7,6 +7,7 @@ interface DeviceState {
   loading: boolean;
   fetchDevices: () => Promise<void>;
   updateDeviceStatus: (id: string, status: string) => void;
+  updateDeviceNotes: (id: string, notes: string) => Promise<void>;
 }
 
 export const useDeviceStore = create<DeviceState>((set, get) => ({
@@ -27,6 +28,15 @@ export const useDeviceStore = create<DeviceState>((set, get) => ({
     set((state) => ({
       devices: state.devices.map((d) =>
         d.id === id ? { ...d, status: status as Device['status'] } : d,
+      ),
+    }));
+  },
+
+  updateDeviceNotes: async (id: string, notes: string) => {
+    await apiClient.put(`/devices/${id}/notes`, { notes });
+    set((state) => ({
+      devices: state.devices.map((d) =>
+        d.id === id ? { ...d, notes } : d,
       ),
     }));
   },

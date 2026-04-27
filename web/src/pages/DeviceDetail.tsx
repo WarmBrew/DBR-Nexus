@@ -1,17 +1,20 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Card, Descriptions, Tag, Button, Typography, message, Table, Space, Modal, Form, Input, Popconfirm, Drawer, Dropdown } from 'antd';
-import { ArrowLeftOutlined, ReloadOutlined, SearchOutlined, InfoCircleOutlined, AppstoreOutlined, SwapOutlined, DashboardOutlined, FieldTimeOutlined, DeleteOutlined, PlayCircleOutlined, ClockCircleOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, ReloadOutlined, SearchOutlined, InfoCircleOutlined, AppstoreOutlined, SwapOutlined, DashboardOutlined, FieldTimeOutlined, DeleteOutlined, PlayCircleOutlined, ClockCircleOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons';
 import apiClient from '../api/client';
 import type { Device, ProcessInfo, Tunnel as TunnelType } from '../api/types';
 import Workbench from '../components/Workbench/Workbench';
 import MonitoringPanel from '../components/Workbench/MonitoringPanel';
+import { InlineUploadProgress } from '../components/Layout/UploadProgressPanel';
+import { useDeviceStore } from '../store/deviceSlice';
 
 const { Title, Text } = Typography;
 
 export default function DeviceDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const updateDeviceNotes = useDeviceStore((s) => s.updateDeviceNotes);
   const [device, setDevice] = useState<Device | null>(null);
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [processSearch, setProcessSearch] = useState('');
@@ -19,6 +22,7 @@ export default function DeviceDetail() {
   const [loading, setLoading] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerContent, setDrawerContent] = useState<'overview' | 'processes' | 'tunnels' | 'monitor'>('overview');
+  const [editingNotes, setEditingNotes] = useState(false);
 
   const fetchDevice = async () => {
     if (!id) return;
@@ -201,12 +205,14 @@ export default function DeviceDetail() {
       {/* Header bar */}
       <div style={{ display: 'flex', alignItems: 'center', padding: '8px 16px', background: '#1e1e1e', borderBottom: '1px solid #3c3c3c', flexShrink: 0 }}>
         <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/devices')} style={{ marginRight: 12 }} type="text" />
-        <Title level={5} style={{ margin: 0, color: '#cccccc' }}>{device.hostname || device.id}</Title>
+        <Title level={5} style={{ margin: 0, color: '#cccccc' }}>{device.notes || device.hostname || device.id}</Title>
+        {device.notes && <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>{device.hostname}</Text>}
         <Tag color={device.status === 'online' ? 'green' : 'red'} style={{ marginLeft: 12 }}>
           {device.status === 'online' ? '在线' : '离线'}
         </Tag>
         <div style={{ flex: 1 }} />
         <Space>
+          <InlineUploadProgress deviceId={id} />
           <Button size="small" icon={<InfoCircleOutlined />} onClick={() => openDrawer('overview')}>概览</Button>
           <Button size="small" icon={<DashboardOutlined />} onClick={() => openDrawer('monitor')}>监控</Button>
           <Button size="small" icon={<AppstoreOutlined />} onClick={() => openDrawer('processes')}>进程</Button>
@@ -238,6 +244,51 @@ export default function DeviceDetail() {
           <Card size="small">
             <Descriptions column={1} size="small">
               <Descriptions.Item label="主机名">{device.hostname}</Descriptions.Item>
+              <Descriptions.Item label="备注">
+                {editingNotes ? (
+                  <Input.TextArea
+                    defaultValue={device.notes || ''}
+                    autoSize={{ minRows: 1, maxRows: 4 }}
+                    autoFocus
+                    style={{ fontSize: 13 }}
+                    onBlur={async (e) => {
+                      const val = e.target.value;
+                      setEditingNotes(false);
+                      if (val !== (device.notes || '')) {
+                        try {
+                          await updateDeviceNotes(id!, val);
+                          setDevice({ ...device, notes: val });
+                          message.success('备注已更新');
+                        } catch {
+                          message.error('更新备注失败');
+                        }
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setEditingNotes(false);
+                      e.stopPropagation();
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  <span
+                    style={{ cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                    onClick={() => setEditingNotes(true)}
+                  >
+                    {device.notes ? (
+                      <>
+                        <Text>{device.notes}</Text>
+                        <EditOutlined style={{ fontSize: 12, color: '#888' }} />
+                      </>
+                    ) : (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        <PlusOutlined style={{ marginRight: 4 }} />点击添加备注
+                      </Text>
+                    )}
+                  </span>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="操作系统">{device.os}</Descriptions.Item>
               <Descriptions.Item label="架构">{device.arch}</Descriptions.Item>
               <Descriptions.Item label="内核">{device.kernel}</Descriptions.Item>

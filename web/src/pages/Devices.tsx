@@ -1,13 +1,12 @@
 import { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Row, Col, Card, Tag, Input, Typography, message, theme, Button, Modal, Select, Form, Tabs, Tooltip } from 'antd';
-import { DesktopOutlined, WindowsOutlined, AppleOutlined, LinuxOutlined, EditOutlined, DownloadOutlined, CopyOutlined } from '@ant-design/icons';
+import { DesktopOutlined, WindowsOutlined, AppleOutlined, LinuxOutlined, EditOutlined, DownloadOutlined, CopyOutlined, PlusOutlined } from '@ant-design/icons';
 import { useDeviceStore } from '../store/deviceSlice';
 import { useAuthStore } from '../store/authSlice';
-import apiClient from '../api/client';
 import { buildAndDownloadAgent } from '../api/agent';
 
-const { Title } = Typography;
+const { Title, Text } = Typography;
 const { Search } = Input;
 
 function OsIcon({ os }: { os: string }) {
@@ -19,7 +18,7 @@ function OsIcon({ os }: { os: string }) {
 }
 
 export default function Devices() {
-  const { devices, loading, fetchDevices } = useDeviceStore();
+  const { devices, loading, fetchDevices, updateDeviceNotes } = useDeviceStore();
   const navigate = useNavigate();
   const { token: themeToken } = theme.useToken();
   const [downloadOpen, setDownloadOpen] = useState(false);
@@ -71,7 +70,8 @@ export default function Devices() {
 
   const updateNotes = async (deviceId: string, notes: string) => {
     try {
-      await apiClient.put(`/devices/${deviceId}/notes`, { notes });
+      await updateDeviceNotes(deviceId, notes);
+      message.success('备注已更新');
     } catch {
       message.error('更新备注失败');
     }
@@ -240,9 +240,10 @@ export default function Devices() {
             >
               <Card.Meta
                 avatar={<OsIcon os={device.os} />}
-                title={device.hostname || device.id.slice(0, 12)}
+                title={device.notes || device.hostname || device.id.slice(0, 12)}
                 description={
                   <div>
+                    {device.notes && <div style={{ fontSize: 11, color: themeToken.colorTextQuaternary, marginBottom: 2 }}>主机名: {device.hostname}</div>}
                     <div style={{ fontSize: 12, color: themeToken.colorTextTertiary }}>{device.os} / {device.arch}</div>
                     <div style={{ fontSize: 12, color: themeToken.colorTextTertiary, fontFamily: 'monospace', display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
                       <span>IP: {device.ip || 'N/A'}</span>
@@ -253,40 +254,62 @@ export default function Devices() {
                     <div
                       style={{
                         fontSize: 12,
-                        color: device.notes ? themeToken.colorTextSecondary : themeToken.colorTextTertiary,
                         marginTop: 4,
                         borderTop: `1px dashed ${themeToken.colorBorderSecondary}`,
                         paddingTop: 4,
-                        cursor: 'text',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 4,
                       }}
                       onClick={(e) => e.stopPropagation()}
                       onMouseDown={(e) => e.stopPropagation()}
                     >
-                      <EditOutlined style={{ fontSize: 10 }} />
-                      <Input.TextArea
-                        value={editingNotes[device.id] !== undefined ? editingNotes[device.id] : (device.notes || '')}
-                        placeholder="点击添加备注..."
-                        autoSize={{ minRows: 1, maxRows: 3 }}
-                        style={{ fontSize: 12, padding: '0 4px', border: 'none', background: 'transparent', resize: 'none' }}
-                        onClick={(e) => e.stopPropagation()}
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onChange={(e) => setEditingNotes(prev => ({ ...prev, [device.id]: e.target.value }))}
-                        onBlur={() => {
-                          const val = editingNotes[device.id] !== undefined ? editingNotes[device.id] : (device.notes || '');
-                          if (val !== (device.notes || '')) {
-                            updateNotes(device.id, val);
-                          }
-                          setEditingNotes(prev => {
-                            const next = { ...prev };
-                            delete next[device.id];
-                            return next;
-                          });
-                        }}
-                        onKeyDown={(e) => e.stopPropagation()}
-                      />
+                      {editingNotes[device.id] !== undefined ? (
+                        <Input.TextArea
+                          value={editingNotes[device.id]}
+                          placeholder="输入备注..."
+                          autoSize={{ minRows: 1, maxRows: 3 }}
+                          style={{ fontSize: 12, padding: '2px 4px', resize: 'none' }}
+                          onClick={(e) => e.stopPropagation()}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onChange={(e) => setEditingNotes(prev => ({ ...prev, [device.id]: e.target.value }))}
+                          onBlur={() => {
+                            const val = editingNotes[device.id];
+                            if (val !== (device.notes || '')) {
+                              updateNotes(device.id, val);
+                            }
+                            setEditingNotes(prev => {
+                              const next = { ...prev };
+                              delete next[device.id];
+                              return next;
+                            });
+                          }}
+                          onKeyDown={(e) => {
+                            e.stopPropagation();
+                            if (e.key === 'Escape') {
+                              setEditingNotes(prev => {
+                                const next = { ...prev };
+                                delete next[device.id];
+                                return next;
+                              });
+                            }
+                          }}
+                          autoFocus
+                        />
+                      ) : device.notes ? (
+                        <div
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: themeToken.colorTextSecondary }}
+                          onClick={() => setEditingNotes(prev => ({ ...prev, [device.id]: device.notes }))}
+                        >
+                          <Text style={{ fontSize: 12, flex: 1 }}>{device.notes}</Text>
+                          <EditOutlined style={{ fontSize: 10, color: themeToken.colorTextQuaternary }} />
+                        </div>
+                      ) : (
+                        <div
+                          style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: themeToken.colorTextQuaternary }}
+                          onClick={() => setEditingNotes(prev => ({ ...prev, [device.id]: '' }))}
+                        >
+                          <PlusOutlined style={{ fontSize: 10 }} />
+                          <span style={{ fontSize: 12 }}>添加备注</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 }

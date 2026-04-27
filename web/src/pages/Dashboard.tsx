@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Row, Col, Card, Statistic, Typography, Table } from 'antd';
+import { Row, Col, Card, Statistic, Typography, Table, theme } from 'antd';
 import { DesktopOutlined, CheckCircleOutlined, CloseCircleOutlined, GlobalOutlined } from '@ant-design/icons';
 import { useDeviceStore } from '../store/deviceSlice';
 import { useNavigate } from 'react-router-dom';
@@ -9,6 +9,7 @@ const { Title, Text } = Typography;
 export default function Dashboard() {
   const { devices, fetchDevices } = useDeviceStore();
   const navigate = useNavigate();
+  const { token: themeToken } = theme.useToken();
 
   useEffect(() => {
     fetchDevices();
@@ -22,10 +23,20 @@ export default function Dashboard() {
 
   const ipColumns = [
     {
-      title: '主机名',
+      title: '名称',
       dataIndex: 'hostname',
       key: 'hostname',
-      render: (v: string, record: any) => v || record.id.slice(0, 12),
+      render: (v: string, record: any) => {
+        const displayName = record.notes || v || record.id.slice(0, 12);
+        return (
+          <div>
+            <div style={{ fontWeight: 500 }}>{displayName}</div>
+            {record.notes && (
+              <Text type="secondary" style={{ fontSize: 11 }}>{v || record.id.slice(0, 8)}</Text>
+            )}
+          </div>
+        );
+      },
     },
     {
       title: 'IP 地址',
@@ -81,7 +92,8 @@ export default function Dashboard() {
           columns={ipColumns}
           dataSource={onlineDevices}
           rowKey="id"
-          size="small"
+          size="middle"
+          bordered
           pagination={false}
           onRow={(record) => ({
             onClick: () => navigate(`/devices/${record.id}`),
@@ -102,9 +114,10 @@ export default function Dashboard() {
               extra={<span style={{ color: device.status === 'online' ? '#52c41a' : '#ff4d4f' }}>{device.status === 'online' ? '在线' : '离线'}</span>}
             >
               <Card.Meta
-                title={device.hostname || device.id.slice(0, 8)}
+                title={device.notes || device.hostname || device.id.slice(0, 8)}
                 description={
                   <div>
+                    {device.notes && <div style={{ fontSize: 11, color: themeToken.colorTextTertiary, marginBottom: 2 }}>主机名: {device.hostname}</div>}
                     <div>{device.os} / {device.arch}</div>
                     <div style={{ fontFamily: 'monospace', fontSize: 12, marginTop: 2 }}>IP: {device.ip || 'N/A'}</div>
                   </div>
